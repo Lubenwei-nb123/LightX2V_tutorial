@@ -496,6 +496,79 @@ def run_vae_encoder(self, first_frame, last_frame=None):
     return vae_encoder_out, latent_shape
 ```
 
+**vae_stride 的含义**：
+
+`vae_stride` 是 VAE 编解码器在三个维度上的**下采样倍率**，格式为 `(temporal_stride, height_stride, width_stride)`。
+
+```
+vae_stride = (4, 8, 8) 的含义：
+    时间维度：每 4 帧压缩为 1 个 latent 帧
+    空间高度：每 8 个像素压缩为 1 个 latent 像素
+    空间宽度：每 8 个像素压缩为 1 个 latent 像素
+```
+
+**形象理解**：VAE 就像一个"压缩器"，把高维的视频像素空间压缩到低维的 latent 空间。`vae_stride` 描述的就是这个压缩比。
+
+```
+原始视频（像素空间）                    latent 空间
+┌──────────────────┐                  ┌────────┐
+│                  │  VAE Encoder     │        │
+│  81帧 × 480 × 832│  ──────────→    │ 21×60×104│
+│  (像素)          │  vae_stride      │ (latent)│
+│                  │  = (4, 8, 8)     │        │
+└──────────────────┘                  └────────┘
+    时间：81帧                         时间：21帧   (81-1)/4+1=21
+    高度：480px                        高度：60     480/8=60
+    宽度：832px                        宽度：104    832/8=104
+```
+
+**为什么时间维度的计算是 `(N-1)/4+1` 而不是 `N/4`？**
+
+因为视频的第一帧需要特殊处理。VAE 在时间维度上的压缩策略是：**第一帧单独保留，剩下的帧每 4 帧压缩为 1 帧**。
+
+```
+原始帧：  [F1] [F2 F3 F4 F5] [F6 F7 F8 F9] ... [F78 F79 F80 F81]
+           │       │              │                    │
+           ▼       ▼              ▼                    ▼
+latent帧：[L1]    [L2]           [L3]        ...     [L21]
+
+第一帧单独 → 1 帧
+剩余 80 帧 → 80/4 = 20 帧
+总计 → 1 + 20 = 21 帧
+公式 → (81-1)/4 + 1 = 21
+```
+
+这就是为什么 I2V 任务要求 `(num_frames - 1) % vae_stride[0] == 0`（第2课 `auto_calc_config` 中的帧数校正逻辑）。如果不满足这个条件，最后一组帧凑不满 4 帧，VAE 无法处理。
+
+**不同模型的 vae_stride 对比**：
+
+| 模型 | vae_stride | 压缩比 | 含义 |
+|------|-----------|--------|------|
+| Wan 2.1/2.2 | (4, 8, 8) | 4×8×8 = 256 | 每 256 个像素体素压缩为 1 个 latent |
+| HunyuanVideo 1.5 | (4, 16, 16) | 4×16×16 = 1024 | 空间压缩更狠，latent 更小 |
+
+HunyuanVideo 的空间下采样是 16 倍（而非 8 倍），意味着同样分辨率的视频，它的 latent 空间更小（60×104 → 30×52），DiT 计算量更少，但 VAE 的重建精度可能略低。
+
+**vae_stride 在代码中的三个关键用途**：
+
+```python
+# 用途1：计算 latent shape（像素 → latent）
+latent_h = target_height // vae_stride[1]      # 480 / 8 = 60
+latent_w = target_width // vae_stride[2]        # 832 / 8 = 104
+latent_t = (num_frames - 1) // vae_stride[0] + 1  # (81-1) / 4 + 1 = 21
+
+# 用途2：从 latent 反算像素尺寸（latent → 像素）
+pixel_h = latent_h * vae_stride[1]              # 60 * 8 = 480
+pixel_w = latent_w * vae_stride[2]              # 104 * 8 = 832
+
+# 用途3：帧数合法性校正（set_config.py:auto_calc_config）
+if config["target_video_length"] % config["vae_stride"][0] != 1:
+    # 向下对齐：确保 (num_frames - 1) 能被 vae_stride[0] 整除
+    config["target_video_length"] = config["target_video_length"] // config["vae_stride"][0] * config["vae_stride"][0] + 1
+```
+
+---
+
 **latent_shape 的含义**：
 
 ```python
@@ -511,11 +584,13 @@ def get_latent_shape_with_lat_hw(self, latent_h, latent_w):
 ```
 
 以 480×832、81帧、vae_stride=(4,8,8) 为例：
-- C = 16
+- C = 16（每个 latent 位置有 16 个通道，类似 RGB 有 3 个通道）
 - T = (81-1) / 4 + 1 = 21
 - H = 480 / 8 = 60
 - W = 832 / 8 = 104
 - latent_shape = [16, 21, 60, 104]
+
+**DiT 的全部工作就是在这个 [16, 21, 60, 104] 的 latent 空间上做去噪**——相比原始视频的 [3, 81, 480, 832]，数据量从 3×81×480×832≈97M 降到了 16×21×60×104≈2.1M，压缩了约 46 倍。这就是 VAE + latent diffusion 的核心价值。
 
 ### 3.5 get_vae_encoder_output()：构造 VAE 输入
 
@@ -570,6 +645,96 @@ def get_encoder_output_i2v(self, clip_encoder_out, vae_encoder_out, text_encoder
 ```
 
 这个字典就是 `self.inputs`，后续传给 `model.infer(self.inputs)` 使用。
+
+### 3.7 Prompt Enhancer 的执行位置
+
+Prompt Enhancer（提示词增强）在 `run_pipeline()` 中执行，位于**编码器运行之前**：
+
+```python
+# default_runner.py:469-484
+def run_pipeline(self, input_info):
+    self.input_info = input_info
+
+    # ① Prompt Enhancer 在这里执行（编码之前）
+    if self.config["use_prompt_enhancer"]:
+        self.input_info.prompt_enhanced = self.post_prompt_enhancer()
+
+    # ② 然后才运行编码器（文本编码器会用到增强后的 prompt）
+    self.inputs = self.run_input_encoder()
+
+    # ③ 最后运行主推理流程
+    gen_video_final = self.run_main()
+    return gen_video_final
+```
+
+**为什么必须放在 `run_input_encoder()` 之前？**
+
+因为文本编码器需要使用增强后的 prompt：
+
+```python
+# wan_runner.py:247
+prompt = input_info.prompt_enhanced if self.config["use_prompt_enhancer"] else input_info.prompt
+```
+
+如果 prompt enhancer 放在编码之后，文本编码器拿到的就是原始的短 prompt，增强就白做了。
+
+**完整时序**：
+
+```
+run_pipeline(input_info)
+    │
+    ├── ① post_prompt_enhancer()        ← 调用远程 LLM 服务扩写 prompt
+    │       "a cat" → "A fluffy orange tabby cat sits gracefully..."
+    │       结果存入 input_info.prompt_enhanced
+    │
+    ├── ② run_input_encoder()           ← 编码所有输入
+    │       ├── run_text_encoder()      ← 用 prompt_enhanced 进行 T5 编码
+    │       ├── run_image_encoder()     ← CLIP 编码（I2V）
+    │       └── run_vae_encoder()       ← VAE 编码（I2V）
+    │
+    └── ③ run_main()                    ← 去噪 + VAE 解码
+```
+
+**`post_prompt_enhancer()` 的实现**：
+
+```python
+# default_runner.py:419-433
+def post_prompt_enhancer(self):
+    while True:
+        for url in self.config["sub_servers"]["prompt_enhancer"]:
+            # 1. 检查远程服务是否空闲
+            response = requests.get(
+                f"{url}/v1/local/prompt_enhancer/generate/service_status"
+            ).json()
+            if response["service_status"] == "idle":
+                # 2. 发送原始 prompt，获取增强结果
+                response = requests.post(
+                    f"{url}/v1/local/prompt_enhancer/generate",
+                    json={
+                        "task_id": generate_task_id(),
+                        "prompt": self.config["prompt"],
+                    },
+                )
+                enhanced_prompt = response.json()["output"]
+                return enhanced_prompt
+        # 所有服务器都忙，继续轮询（while True）
+```
+
+注意这是一个**忙等待（busy-wait）轮询**：如果所有 enhancer 服务都在忙，它会不断重试直到有空闲服务。这在高并发场景下可能成为瓶颈。
+
+**Prompt Enhancer 的启用条件**（回顾第1课）：
+
+```python
+# default_runner.py:60-66
+# 只有同时满足以下条件才启用：
+# 1. 任务类型是 T2V（I2V 有图像参考，prompt 不那么重要）
+# 2. 配置中指定了 prompt_enhancer 的服务地址
+# 3. 服务实际可用（check_sub_servers 检查通过）
+if self.config["task"] == "t2v" and self.config.get("sub_servers", {}).get("prompt_enhancer"):
+    self.has_prompt_enhancer = True
+    if not self.check_sub_servers("prompt_enhancer"):
+        self.has_prompt_enhancer = False
+```
 
 ---
 
@@ -1292,14 +1457,117 @@ elif self.model_cls in ["my_model"]:
 1. **为什么 load_text_encoder() 返回列表而不是单个对象？**
    - 提示：考虑 HunyuanVideo 的双编码器
 
+   可能有模型用多个编码器
+
+   **批改**：方向正确 ✅，但可以更具体。
+
+   **参考答案**：因为不同模型使用的文本编码器数量不同：
+   - WanRunner：只有 T5，返回 `[text_encoder]`，列表长度 1
+   - HunyuanVideo15Runner：有 Qwen2.5-VL + ByT5，返回 `[text_encoder, byt5]`，列表长度 2
+
+   如果接口设计成返回单个对象，HunyuanVideo 就无法在同一个接口里返回两个编码器。用列表统一接口后，`run_text_encoder()` 可以通过 `self.text_encoders[0]`、`self.text_encoders[1]` 分别使用。
+
+   这体现了一个设计原则：**接口按最复杂的使用场景设计，简单场景退化为列表长度为 1 的特例**。
+
 2. **MultiModelStruct 的 offload_granularity="model" 是什么意思？它与 "block" 和 "phase" 有何区别？**
    - 提示：考虑 MoE 双模型切换时的显存管理
+
+   model的意思是将整个dit模型offload到cpu上，block和phase则是以更细的粒度做offload。
+
+   **批改**：核心理解正确 ✅，但对 "model" 粒度的理解不够精确 ❌。
+
+   `offload_granularity="model"` 不是简单地把整个 DiT 放到 CPU，而是专门为 **MoE 双模型场景**设计的——在高噪声模型和低噪声模型之间做整体切换时的 offload。
+
+   看 `MultiModelStruct.get_current_model_index()` 中的逻辑：
+
+   ```python
+   if self.config.get("offload_granularity") == "model":
+       if self.cur_model_index == 1:  # 上一步用的是 low_noise
+           self.offload_cpu(model_index=1)   # 把 low_noise 整个搬到 CPU
+           self.to_cuda(model_index=0)       # 把 high_noise 整个搬到 GPU
+   ```
+
+   三种粒度对比：
+
+   | 粒度 | 单位 | 适用场景 | 切换频率 |
+   |------|------|---------|---------|
+   | `"model"` | 整个 DiT 模型 | MoE 双模型切换 | 每次推理切换 1 次（高→低噪声） |
+   | `"phase"` | 整个组件（T5/CLIP/DiT/VAE） | 单模型，组件间不同时使用 | 每次推理切换 3-4 次 |
+   | `"block"` | DiT 的单个 Transformer Block | 单模型，逐 block 推理 | 每个 step 切换 N 次（N=block数） |
+
+   `"model"` 粒度只在 Wan2.2 MoE 中有意义——它确保同一时刻 GPU 上只有一个完整的 DiT 模型，另一个在 CPU 上等待。对于非 MoE 的普通 Runner，这个选项没有意义。
 
 3. **WanAudioRunner 为什么要覆盖 run_main() 而不是仅覆盖生命周期钩子？**
    - 提示：看流式音频输入的 while True 循环
 
+   **参考答案**：因为 DefaultRunner 的 `run_main()` 的循环结构是**固定次数**的 `for segment_idx in range(self.video_segment_num)`，而 WanAudioRunner 的流式模式需要一个**无限循环** `while True`，逐段从音频流中获取数据。
+
+   具体来说，有三个结构性差异无法仅通过覆盖钩子实现：
+
+   1. **循环条件不同**：固定 `for` → 无限 `while True`，需要从 `va_controller.reader` 动态获取音频段
+   2. **错误恢复**：流式模式需要 try-except 捕获 pause_signal 后继续运行（而不是终止），这个 try-except 包裹了整个段的处理过程
+   3. **控制流中断**：流式模式有 `wait`、`switch_image`、`blank_to_voice` 等控制指令，需要在循环内做分支跳转
+
+   ```python
+   # DefaultRunner.run_main() 的循环：
+   for segment_idx in range(self.video_segment_num):  # 固定次数
+       self.init_run_segment(segment_idx)
+       latents = self.run_segment(segment_idx)
+       self.gen_video = self.run_vae_decoder(latents)
+       self.end_run_segment(segment_idx)
+
+   # WanAudioRunner.run_main() 的循环：
+   while True:  # 无限
+       control = self.va_controller.next_control()  # ← 钩子里做不了
+       if control.action == "wait":
+           continue                                  # ← 钩子里做不了
+       audio_array = self.va_controller.reader.get_audio_segment()
+       try:
+           self.init_run_segment(segment_idx, audio_array)  # 多了参数
+           latents = self.run_segment(segment_idx)
+           self.end_run_segment(segment_idx, valid_duration)  # 多了参数
+       except Exception as e:
+           if "pause_signal" in str(e):
+               continue  # 暂停后继续，而非终止     # ← 钩子里做不了
+   ```
+
+   总结：当子类需要的不只是在固定节点"加戏"，而是要**改变控制流本身**（循环条件、异常处理、分支跳转）时，就必须覆盖整个方法，生命周期钩子不够用。
+
 4. **如果要在 WanRunner 中支持一种新的任务类型 "audio2video"（音频转视频，无图像输入），需要改哪些地方？**
    - 提示：参考 T2V 和 AudioRunner 的实现
+
+   **参考答案**：
+
+   **必须修改的**：
+
+   - `input_info.py`：新建 `A2VInputInfo` dataclass，包含 `audio_path`、`prompt`、`seed` 等字段，在 `init_empty_input_info()` 中添加 `elif task == "a2v"` 分支
+   - `default_runner.py init_modules()`：添加 `elif self.config["task"] == "a2v": self.run_input_encoder = self._run_input_encoder_local_a2v`
+   - `pipeline.py generate()`：确保 `audio_path` 参数能传递到 input_info
+   - 实现 `_run_input_encoder_local_a2v()`：参考 T2V（无图像输入）+ AudioRunner（有音频输入）
+
+   ```python
+   # 新方法：类似 T2V（无图像）但多了音频编码
+   def _run_input_encoder_local_a2v(self):
+       self.input_info.latent_shape = self.get_latent_shape_with_target_hw()
+       text_encoder_output = self.run_text_encoder(self.input_info)
+
+       # 音频部分：参考 WanAudioRunner
+       audio_segments, expected_frames, _, audio_num = self.read_audio_input(
+           self.input_info.audio_path
+       )
+
+       return {
+           "text_encoder_output": text_encoder_output,
+           "image_encoder_output": None,  # 无图像输入
+           "audio_segments": audio_segments,
+           "expected_frames": expected_frames,
+       }
+   ```
+
+   **可能需要的**：
+   - 如果 audio2video 也需要多段生成，需要覆盖 `get_video_segment_num()` 和相关的生命周期钩子（参考 WanAudioRunner 的做法）
+   - 如果需要独立的音频编码器，需要在 `load_model()` 或单独的方法中加载
+
 
 ---
 
