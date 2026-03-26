@@ -1487,15 +1487,74 @@ elif self.model_cls in ["my_model"]:
            self.to_cuda(model_index=0)       # 把 high_noise 整个搬到 GPU
    ```
 
-   三种粒度对比：
+   三种粒度对比（从粗到细）：
 
-   | 粒度 | 单位 | 适用场景 | 切换频率 |
-   |------|------|---------|---------|
-   | `"model"` | 整个 DiT 模型 | MoE 双模型切换 | 每次推理切换 1 次（高→低噪声） |
-   | `"phase"` | 整个组件（T5/CLIP/DiT/VAE） | 单模型，组件间不同时使用 | 每次推理切换 3-4 次 |
-   | `"block"` | DiT 的单个 Transformer Block | 单模型，逐 block 推理 | 每个 step 切换 N 次（N=block数） |
+   ```
+   ┌─────────────────────────────────────────────────────────────┐
+   │  "model" 粒度：整个 DiT 模型为单位                           │
+   │  ┌─────────────────────────────────────────────────────┐    │
+   │  │  "block" 粒度：单个 DiT Block 为单位                │    │
+   │  │  ┌─────────────────────────────────────────────┐    │    │
+   │  │  │  "phase" 粒度：Block 内部的子模块为单位      │    │    │
+   │  │  │  phase0: SelfAttention                      │    │    │
+   │  │  │  phase1: CrossAttention                     │    │    │
+   │  │  │  phase2: FFN                                │    │    │
+   │  │  └─────────────────────────────────────────────┘    │    │
+   │  └─────────────────────────────────────────────────────┘    │
+   └─────────────────────────────────────────────────────────────┘
+   ```
 
-   `"model"` 粒度只在 Wan2.2 MoE 中有意义——它确保同一时刻 GPU 上只有一个完整的 DiT 模型，另一个在 CPU 上等待。对于非 MoE 的普通 Runner，这个选项没有意义。
+   | 粒度 | 单位 | GPU 上同时存在的权重 | 切换频率（每个 step） |
+   |------|------|--------------------|--------------------|
+   | `"model"` | 整个 DiT 模型 | 1 个完整 DiT | 每次推理切换 1 次（MoE 高→低噪声） |
+   | `"block"` | 单个 Transformer Block | 2 个 Block 的权重（双缓冲） | N 次（N=Block 数，如 48） |
+   | `"phase"` | Block 内的子模块 | 1 个 Phase 的权重 | N×3 次（每个 Block 内切 3 次） |
+
+   **phase 是比 block 更细的粒度**。看源码中的实现（`wan/infer/offload/transformer_infer.py`）：
+
+   ```python
+   # block 粒度：遍历 block，每次 GPU 上放 1 个完整 block
+   def infer_with_blocks_offload(self, blocks, x, pre_infer_out):
+       for block_idx in range(len(blocks)):
+           self.offload_manager.prefetch_weights((block_idx + 1) % len(blocks), blocks)
+           x = self.infer_block(self.offload_manager.cuda_buffers[0], x, pre_infer_out)
+           self.offload_manager.swap_blocks()
+
+   # phase 粒度：遍历 block，每个 block 内部再遍历 phase
+   def infer_with_phases_offload(self, blocks, x, pre_infer_out):
+       for block_idx in range(len(blocks)):
+           x = self.infer_phases(block_idx, blocks, x, pre_infer_out)
+
+   def infer_phases(self, block_idx, blocks, x, pre_infer_out):
+       for phase_idx in range(self.phases_num):   # phases_num = 3
+           # GPU 上只放当前 phase 的权重
+           self.offload_manager.prefetch_phase(next_block_idx, next_phase_idx, blocks)
+           x = self.infer_phase(phase_idx, self.offload_manager.cuda_buffers[phase_idx], x, ...)
+           self.offload_manager.swap_phases()
+
+   def infer_phase(self, cur_phase_idx, cur_phase, x, pre_infer_out):
+       if cur_phase_idx == 0:    # SelfAttention
+           ...
+       elif cur_phase_idx == 1:  # CrossAttention
+           ...
+       elif cur_phase_idx == 2:  # FFN
+           ...
+   ```
+
+   每个 DiT Block 在权重层面被拆成 3 个 phase（`transformer_weights.py:174`）：
+
+   ```python
+   self.compute_phases = WeightModuleList([
+       WanSelfAttention(...),   # phase 0
+       WanCrossAttention(...),  # phase 1
+       WanFFN(...),             # phase 2
+   ])
+   ```
+
+   **什么时候用哪种？**
+   - `"model"`：只在 Wan2.2 MoE 中有意义，确保同一时刻 GPU 上只有一个完整 DiT
+   - `"block"`：显存够放 2 个 Block 但放不下整个 DiT 时使用（如 4090 24G）
+   - `"phase"`：显存连 1 个完整 Block 都放不下时使用，用更多 CPU↔GPU 传输换更低显存占用
 
 3. **WanAudioRunner 为什么要覆盖 run_main() 而不是仅覆盖生命周期钩子？**
    - 提示：看流式音频输入的 while True 循环
