@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//data/phd/Wan2.1-I2V-14B-480P/**)",
+      "Read(//data/phd/hf_models/Wan2.1-I2V-14B-480P/**)"
+    ]
+  }
+}
